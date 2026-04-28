@@ -141,20 +141,37 @@ class TestCollectCursorFiles(unittest.TestCase):
             self.assertTrue(any(str(f).endswith("workspace.json") for f in files))
 
     @patch("cursor_chronicle.backup.get_cursor_paths")
-    def test_skips_non_directories(self, mock_paths):
+    def test_collects_only_required_cursor_files(self, mock_paths):
         with tempfile.TemporaryDirectory() as tmpdir:
             cursor_path = Path(tmpdir) / "Cursor" / "User"
             ws_path = cursor_path / "workspaceStorage"
-            ws_path.mkdir(parents=True)
+            workspace_dir = ws_path / "workspace1"
+            workspace_dir.mkdir(parents=True)
             global_path = cursor_path / "globalStorage" / "state.vscdb"
+            global_path.parent.mkdir(parents=True)
             mock_paths.return_value = (cursor_path, ws_path, global_path)
 
-            stray = ws_path / "some_file.txt"
-            stray.write_text("not a workspace")
+            required_files = {
+                global_path,
+                global_path.parent / "storage.json",
+                workspace_dir / "state.vscdb",
+                workspace_dir / "workspace.json",
+            }
+            for required_file in required_files:
+                required_file.write_text("required", encoding="utf-8")
+
+            skipped_files = [
+                ws_path / "some_file.txt",
+                cursor_path.parent / "process-monitor" / "1777276800000.log",
+                cursor_path.parent / "logs" / "main.log",
+            ]
+            for skipped_file in skipped_files:
+                skipped_file.parent.mkdir(parents=True, exist_ok=True)
+                skipped_file.write_text("volatile", encoding="utf-8")
 
             base, files = _collect_cursor_files()
             self.assertEqual(base, cursor_path.parent)
-            self.assertIn(stray, files)
+            self.assertEqual(set(files), required_files)
 
     @patch("cursor_chronicle.backup.get_cursor_paths")
     def test_collects_new_cursor_project_transcripts(self, mock_paths):
@@ -362,6 +379,28 @@ class TestCreateBackup(unittest.TestCase):
 
             self.assertGreater(result["compression_ratio"], 50.0)
             self.assertLess(result["compressed_size"], result["total_size"])
+
+    @patch("cursor_chronicle.backup._collect_cursor_files")
+    def test_skips_files_removed_during_backup(self, mock_collect):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base = Path(tmpdir) / "cursor"
+            base.mkdir()
+            kept = base / "state.vscdb"
+            kept.write_text("database content")
+            removed = base / "transient.log"
+            removed.write_text("temporary")
+
+            mock_collect.return_value = (base, [kept, removed])
+            removed.unlink()
+            backup_dir = Path(tmpdir) / "backups"
+
+            result = create_backup(backup_dir=backup_dir)
+
+            self.assertIsNotNone(result["backup_path"])
+            self.assertEqual(result["total_files"], 1)
+            with tarfile.open(result["backup_path"], "r:xz") as tar:
+                self.assertIn("state.vscdb", tar.getnames())
+                self.assertNotIn("transient.log", tar.getnames())
 
 
 class TestConstants(unittest.TestCase):

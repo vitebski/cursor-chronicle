@@ -295,7 +295,7 @@ You can override these settings via command-line arguments (`--export-path`, `--
 
 ## Backup & Restore
 
-Protect your Cursor IDE data with compressed backups. Backups capture the entire Cursor data directory as a `.tar.xz` archive with LZMA compression, and can be restored at any time.
+Protect your Cursor IDE conversation data with compressed backups. Backups capture only the files needed to restore chat history and project mappings, then store them as a `.tar.xz` archive with LZMA compression.
 
 ### Backup Commands
 
@@ -321,7 +321,7 @@ cursor-chronicle --restore latest --no-pre-backup
 
 ### How It Works
 
-1. **Backup** scans the Cursor data directory (`~/.config/Cursor/`), compresses all files into a single `.tar.xz` archive, and stores it in `~/.cursor-chronicle/backups/` by default.
+1. **Backup** scans the Cursor user data directory for chat databases, SQLite sidecars, workspace metadata, and agent transcript JSONL files, then stores them in `~/.cursor-chronicle/backups/` by default.
 2. **Restore** extracts the archive back to the original location. By default, a safety backup is created before restoring, so you can roll back if needed.
 3. Each archive includes a `backup_meta.json` with file inventory, sizes, and timestamps.
 

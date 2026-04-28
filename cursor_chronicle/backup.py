@@ -13,6 +13,8 @@ import json
 import lzma
 import os
 import shutil
+import stat as stat_module
+import sys
 import tarfile
 import tempfile
 from datetime import datetime
@@ -25,7 +27,12 @@ from .backup_formatters import (
     format_backup_summary,
     format_restore_summary,
 )
-from .utils import CURSOR_PROJECTS_DIR_ENV, get_cursor_paths, get_cursor_projects_dir
+from .utils import (
+    CURSOR_PROJECTS_DIR_ENV,
+    CURSOR_USER_DIR_ENV,
+    get_cursor_paths,
+    get_cursor_projects_dir,
+)
 
 # Default backup directory
 DEFAULT_BACKUP_DIR = Path.home() / ".cursor-chronicle" / "backups"
@@ -42,6 +49,11 @@ LZMA_PRESET = 3
 
 # Emit progress callback at most once per this many bytes while compressing.
 PROGRESS_UPDATE_INTERVAL_BYTES = 2 * 1024 * 1024
+
+SQLITE_SIDECAR_SUFFIXES = ("-wal", "-shm")
+WORKSPACE_BACKUP_FILENAMES = ("state.vscdb", "workspace.json")
+
+FileSnapshot = Tuple[Path, str, int, float]
 
 # Re-export formatting functions for backward compatibility
 __all__ = [
@@ -64,10 +76,8 @@ def get_backup_dir(config: Optional[Dict] = None) -> Path:
 
 
 def _collect_cursor_files() -> Tuple[Path, List[Path]]:
-    """Collect all Cursor files that need to be backed up."""
-    cursor_config_path, _, _ = get_cursor_paths()
-    # get_cursor_paths() returns ".../Cursor/User". We back up the entire Cursor
-    # directory so restore can recover full IDE state, not only chat DB files.
+    """Collect Cursor data files required to preserve chat history."""
+    cursor_config_path, workspace_storage_path, global_storage_path = get_cursor_paths()
     cursor_root = cursor_config_path.parent
     roots = [cursor_root] if cursor_root.exists() else []
 
@@ -87,14 +97,68 @@ def _collect_cursor_files() -> Tuple[Path, List[Path]]:
         base_path = Path(os.path.commonpath([str(root) for root in roots]))
 
     files_to_backup = []
-    for root in roots:
-        for path in root.rglob("*"):
-            if not path.is_file() or path.is_symlink():
-                continue
-            files_to_backup.append(path)
+    _append_sqlite_file(files_to_backup, global_storage_path)
+    _append_required_file(files_to_backup, global_storage_path.parent / "storage.json")
+
+    _append_workspace_storage_files(files_to_backup, workspace_storage_path)
+
+    if projects_root in roots:
+        _append_agent_transcripts(files_to_backup, projects_root)
 
     files_to_backup.sort(key=lambda p: str(p))
     return base_path, files_to_backup
+
+
+def _append_workspace_storage_files(
+    files_to_backup: List[Path],
+    workspace_storage_path: Path,
+) -> None:
+    if not workspace_storage_path.exists():
+        return
+
+    try:
+        workspace_dirs = list(workspace_storage_path.iterdir())
+    except OSError:
+        return
+
+    for workspace_dir in workspace_dirs:
+        try:
+            if not workspace_dir.is_dir() or workspace_dir.is_symlink():
+                continue
+        except OSError:
+            continue
+        for filename in WORKSPACE_BACKUP_FILENAMES:
+            path = workspace_dir / filename
+            if path.name == "state.vscdb":
+                _append_sqlite_file(files_to_backup, path)
+            else:
+                _append_required_file(files_to_backup, path)
+
+
+def _append_agent_transcripts(files_to_backup: List[Path], projects_root: Path) -> None:
+    try:
+        transcripts = projects_root.glob("*/agent-transcripts/*/*.jsonl")
+        for transcript in transcripts:
+            _append_required_file(files_to_backup, transcript)
+    except OSError:
+        return
+
+
+def _append_sqlite_file(files_to_backup: List[Path], db_path: Path) -> None:
+    _append_required_file(files_to_backup, db_path)
+    for suffix in SQLITE_SIDECAR_SUFFIXES:
+        _append_required_file(
+            files_to_backup,
+            db_path.with_name(f"{db_path.name}{suffix}"),
+        )
+
+
+def _append_required_file(files_to_backup: List[Path], file_path: Path) -> None:
+    try:
+        if file_path.is_file() and not file_path.is_symlink():
+            files_to_backup.append(file_path)
+    except OSError:
+        return
 
 
 def _should_collect_cursor_projects(cursor_config_path: Path, projects_root: Path) -> bool:
@@ -102,39 +166,81 @@ def _should_collect_cursor_projects(cursor_config_path: Path, projects_root: Pat
     if os.environ.get(CURSOR_PROJECTS_DIR_ENV):
         return True
 
-    cursor_home = projects_root.parent.parent
-    try:
-        cursor_config_path.relative_to(cursor_home)
-    except ValueError:
+    if os.environ.get(CURSOR_USER_DIR_ENV):
         return False
-    return True
+
+    return cursor_config_path == _default_cursor_user_dir_for_home(
+        projects_root.parent.parent,
+    )
+
+
+def _default_cursor_user_dir_for_home(home: Path) -> Path:
+    if sys.platform == "darwin":
+        return home / "Library" / "Application Support" / "Cursor" / "User"
+    if sys.platform == "win32":
+        return home / "AppData" / "Roaming" / "Cursor" / "User"
+    return home / ".config" / "Cursor" / "User"
 
 
 def _build_backup_metadata(files: List[Path], base_path: Path) -> Dict:
     """Build metadata dict for the backup archive."""
+    return _build_backup_metadata_from_snapshots(
+        _snapshot_backup_files(files, base_path),
+        base_path,
+    )
+
+
+def _snapshot_backup_files(files: List[Path], base_path: Path) -> List[FileSnapshot]:
+    """Capture file metadata while ignoring files that disappear mid-backup."""
+    snapshots = []
+    for file_path in files:
+        try:
+            if file_path.is_symlink():
+                continue
+            file_stat = file_path.stat()
+        except OSError:
+            continue
+        if not stat_module.S_ISREG(file_stat.st_mode):
+            continue
+        snapshots.append((
+            file_path,
+            _archive_path(file_path, base_path),
+            file_stat.st_size,
+            file_stat.st_mtime,
+        ))
+    return snapshots
+
+
+def _build_backup_metadata_from_snapshots(
+    snapshots: List[FileSnapshot],
+    base_path: Path,
+) -> Dict:
+    """Build metadata dict for already-snapshotted files."""
     file_entries = []
     total_size = 0
 
-    for f in files:
-        size = f.stat().st_size
+    for _, rel_path, size, modified in snapshots:
         total_size += size
-        try:
-            rel = str(f.relative_to(base_path))
-        except ValueError:
-            rel = str(f)
         file_entries.append({
-            "path": rel,
+            "path": rel_path,
             "size": size,
-            "modified": datetime.fromtimestamp(f.stat().st_mtime).isoformat(),
+            "modified": datetime.fromtimestamp(modified).isoformat(),
         })
 
     return {
         "created_at": datetime.now().isoformat(),
         "cursor_base_path": str(base_path),
-        "total_files": len(files),
+        "total_files": len(snapshots),
         "total_size_bytes": total_size,
         "files": file_entries,
     }
+
+
+def _archive_path(file_path: Path, base_path: Path) -> str:
+    try:
+        return str(file_path.relative_to(base_path))
+    except ValueError:
+        return str(file_path)
 
 
 def _cleanup_partial_backups(backup_dir: Path) -> None:
@@ -158,7 +264,8 @@ def create_backup(
     _cleanup_partial_backups(backup_dir)
 
     base_path, files = _collect_cursor_files()
-    if not files:
+    snapshots = _snapshot_backup_files(files, base_path)
+    if not snapshots:
         return {
             "backup_path": None, "total_files": 0, "total_size": 0,
             "compressed_size": 0, "compression_ratio": 0.0,
@@ -172,9 +279,9 @@ def create_backup(
     if tmp_backup_path.exists():
         tmp_backup_path.unlink()
 
-    metadata = _build_backup_metadata(files, base_path)
+    metadata = _build_backup_metadata_from_snapshots(snapshots, base_path)
     total_size = metadata["total_size_bytes"]
-    total_files = len(files)
+    total_files = len(snapshots)
 
     bytes_processed = 0
     last_reported_bytes = 0
@@ -218,25 +325,26 @@ def create_backup(
             meta_info.size = len(meta_bytes)
             tar.addfile(meta_info, io.BytesIO(meta_bytes))
 
-            for idx, file_path in enumerate(files, 1):
-                try:
-                    rel_path = str(file_path.relative_to(base_path))
-                except ValueError:
-                    rel_path = str(file_path)
-
+            for idx, (file_path, rel_path, file_size, _) in enumerate(snapshots, 1):
                 def _on_read(chunk_len: int) -> None:
                     nonlocal bytes_processed
                     bytes_processed += chunk_len
                     _report_progress(current=idx, file_path=rel_path, force=False)
 
-                with file_path.open("rb") as src_file:
-                    tar_info = tar.gettarinfo(
-                        name=str(file_path),
-                        arcname=rel_path,
-                        fileobj=src_file,
-                    )
-                    src_file.seek(0)
-                    tar.addfile(tarinfo=tar_info, fileobj=_ProgressReader(src_file, _on_read))
+                try:
+                    with file_path.open("rb") as src_file:
+                        tar_info = tar.gettarinfo(
+                            name=str(file_path),
+                            arcname=rel_path,
+                            fileobj=src_file,
+                        )
+                        src_file.seek(0)
+                        tar.addfile(
+                            tarinfo=tar_info,
+                            fileobj=_ProgressReader(src_file, _on_read),
+                        )
+                except FileNotFoundError:
+                    bytes_processed += file_size
 
                 # Force a callback at file boundary for many small files.
                 _report_progress(current=idx, file_path=rel_path, force=True)
