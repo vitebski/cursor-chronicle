@@ -9,6 +9,7 @@ import tempfile
 import unittest
 from datetime import datetime
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
@@ -382,6 +383,87 @@ class TestGetProjectsMultiRootMetadata(unittest.TestCase):
         })
         self.assertEqual(name, "my-app")
         self.assertEqual(path, "/tmp/my-app.code-workspace")
+
+
+class TestGetProjectsAgentTranscripts(unittest.TestCase):
+    """Newer Cursor versions store agent dialogs under ~/.cursor/projects."""
+
+    def test_get_projects_reads_agent_transcripts_without_state_db(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            project_path = home / "Documents" / "demo-app"
+            project_path.mkdir(parents=True)
+            project_uri = project_path.resolve().as_uri()
+
+            cursor_user = home / "Library" / "Application Support" / "Cursor" / "User"
+            global_storage = cursor_user / "globalStorage"
+            global_storage.mkdir(parents=True)
+            (global_storage / "storage.json").write_text(
+                json.dumps({
+                    "backupWorkspaces": {
+                        "folders": [{"folderUri": project_uri}],
+                        "workspaces": [],
+                        "emptyWindows": [],
+                    }
+                }),
+                encoding="utf-8",
+            )
+
+            workspace_dir = cursor_user / "workspaceStorage" / "legacy-workspace"
+            workspace_dir.mkdir(parents=True)
+            (workspace_dir / "workspace.json").write_text(
+                json.dumps({"folder": project_uri}),
+                encoding="utf-8",
+            )
+
+            from cursor_chronicle.utils import cursor_project_slug_for_path
+
+            slug = cursor_project_slug_for_path(str(project_path.resolve()))
+            transcript_dir = (
+                home / ".cursor" / "projects" / slug / "agent-transcripts" / "chat-1"
+            )
+            transcript_dir.mkdir(parents=True)
+            (transcript_dir / "chat-1.jsonl").write_text(
+                "\n".join([
+                    json.dumps({
+                        "role": "user",
+                        "message": {
+                            "content": [
+                                {"type": "text", "text": "How do I back up dialogs?"}
+                            ]
+                        },
+                    }),
+                    json.dumps({
+                        "role": "assistant",
+                        "message": {
+                            "content": [
+                                {
+                                    "type": "text",
+                                    "text": "Use cursor-chronicle --backup.",
+                                }
+                            ]
+                        },
+                    }),
+                ]),
+                encoding="utf-8",
+            )
+
+            with patch("cursor_chronicle.utils.Path.home", return_value=home):
+                with patch("cursor_chronicle.utils.sys.platform", "darwin"):
+                    viewer = cursor_chronicle.CursorChatViewer()
+                    projects = viewer.get_projects()
+
+            self.assertEqual(len(projects), 1)
+            self.assertEqual(projects[0]["project_name"], "demo-app")
+            self.assertEqual(projects[0]["folder_path"], str(project_path.resolve()))
+            self.assertEqual(len(projects[0]["composers"]), 1)
+
+            messages = viewer.get_dialog_messages(
+                projects[0]["composers"][0]["composerId"]
+            )
+            self.assertEqual([m["type"] for m in messages], [1, 2])
+            self.assertEqual(messages[0]["text"], "How do I back up dialogs?")
+            self.assertEqual(messages[1]["text"], "Use cursor-chronicle --backup.")
 
 
 class TestListProjects(unittest.TestCase):

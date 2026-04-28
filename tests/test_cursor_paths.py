@@ -13,6 +13,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from cursor_chronicle.utils import (  # noqa: E402
     CURSOR_USER_DIR_ENV,
+    cursor_project_slug_for_path,
     get_cursor_paths,
 )
 
@@ -78,6 +79,17 @@ class TestCursorUserDirEnv(unittest.TestCase):
             / "User"
         )
         self.assertEqual(base, expected)
+
+
+class TestCursorProjectSlug(unittest.TestCase):
+    """Cursor's ~/.cursor/projects names normalize path separators and punctuation."""
+
+    def test_slug_normalizes_underscores_like_cursor(self):
+        slug = cursor_project_slug_for_path(
+            "/Users/slava/Documents/cursor-chronicle/cursor_chronicle"
+        )
+
+        self.assertEqual(slug, "Users-slava-Documents-cursor-chronicle-cursor-chronicle")
 
 
 if __name__ == "__main__":

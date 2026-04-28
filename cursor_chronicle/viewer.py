@@ -15,7 +15,12 @@ from .formatters import (
     infer_model_from_context as _infer_model_from_context,
 )
 from .messages import get_dialog_messages as _get_dialog_messages
-from .utils import TOOL_TYPES, get_cursor_paths, parse_workspace_storage_meta
+from .transcripts import (
+    iter_agent_transcripts,
+    load_project_path_map,
+    parse_transcript_summary,
+)
+from .utils import TOOL_TYPES, get_cursor_paths, get_cursor_projects_dir, parse_workspace_storage_meta
 
 
 class CursorChatViewer:
@@ -26,6 +31,7 @@ class CursorChatViewer:
         self.cursor_config_path = paths[0]
         self.workspace_storage_path = paths[1]
         self.global_storage_path = paths[2]
+        self.cursor_projects_path = get_cursor_projects_dir()
         self.tool_types = TOOL_TYPES
 
     def get_dialog_messages(self, composer_id: str) -> List[Dict]:
@@ -61,6 +67,21 @@ class CursorChatViewer:
 
     def get_projects(self) -> List[Dict]:
         """Get list of all projects with their metadata."""
+        projects = self._get_workspace_storage_projects()
+
+        if self._should_include_agent_transcripts():
+            self._merge_agent_transcript_projects(projects)
+
+        projects.sort(
+            key=lambda x: (
+                x["latest_dialog"].get("lastUpdatedAt", 0) if x["latest_dialog"] else 0
+            ),
+            reverse=True,
+        )
+        return projects
+
+    def _get_workspace_storage_projects(self) -> List[Dict]:
+        """Read legacy workspaceStorage/state.vscdb projects."""
         projects = []
 
         if not self.workspace_storage_path.exists():
@@ -113,13 +134,60 @@ class CursorChatViewer:
                 print(f"Error processing project {workspace_dir.name}")
                 continue
 
-        projects.sort(
-            key=lambda x: (
-                x["latest_dialog"].get("lastUpdatedAt", 0) if x["latest_dialog"] else 0
-            ),
-            reverse=True,
-        )
         return projects
+
+    def _should_include_agent_transcripts(self) -> bool:
+        """Avoid mixing real ~/.cursor/projects into tests with overridden paths."""
+        return self.workspace_storage_path == get_cursor_paths()[1]
+
+    def _merge_agent_transcript_projects(self, projects: List[Dict]) -> None:
+        """Append or merge newer ~/.cursor/projects transcript-backed dialogs."""
+        project_path_map = load_project_path_map(self.cursor_config_path)
+        projects_by_key = {
+            self._project_merge_key(project): project
+            for project in projects
+        }
+
+        for transcript_path in iter_agent_transcripts(self.cursor_projects_path):
+            try:
+                relative_parts = transcript_path.relative_to(self.cursor_projects_path).parts
+            except ValueError:
+                continue
+            if not relative_parts:
+                continue
+
+            project_slug = relative_parts[0]
+            project_name, folder_path = project_path_map.get(
+                project_slug,
+                (project_slug, str(self.cursor_projects_path / project_slug)),
+            )
+            composer = parse_transcript_summary(transcript_path)
+            key = folder_path or project_name
+
+            if key not in projects_by_key:
+                projects_by_key[key] = {
+                    "workspace_id": f"agent-transcripts:{project_slug}",
+                    "project_name": project_name,
+                    "folder_path": folder_path,
+                    "composers": [],
+                    "latest_dialog": None,
+                    "state_db_path": None,
+                }
+                projects.append(projects_by_key[key])
+
+            project = projects_by_key[key]
+            project["composers"].append(composer)
+            project["latest_dialog"] = self._latest_dialog(project["composers"])
+
+    @staticmethod
+    def _project_merge_key(project: Dict) -> str:
+        return project.get("folder_path") or project.get("project_name") or ""
+
+    @staticmethod
+    def _latest_dialog(composers: List[Dict]) -> Optional[Dict]:
+        if not composers:
+            return None
+        return max(composers, key=lambda x: x.get("lastUpdatedAt", 0))
 
     def get_all_dialogs(
         self,

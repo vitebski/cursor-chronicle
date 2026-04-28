@@ -156,6 +156,42 @@ class TestCollectCursorFiles(unittest.TestCase):
             self.assertEqual(base, cursor_path.parent)
             self.assertIn(stray, files)
 
+    @patch("cursor_chronicle.backup.get_cursor_paths")
+    def test_collects_new_cursor_project_transcripts(self, mock_paths):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            home = Path(tmpdir)
+            cursor_path = home / "Library" / "Application Support" / "Cursor" / "User"
+            ws_path = cursor_path / "workspaceStorage"
+            global_path = cursor_path / "globalStorage" / "state.vscdb"
+            mock_paths.return_value = (cursor_path, ws_path, global_path)
+
+            workspace_dir = ws_path / "workspace1"
+            workspace_dir.mkdir(parents=True)
+            workspace_json = workspace_dir / "workspace.json"
+            workspace_json.write_text('{"folder": "file:///test"}', encoding="utf-8")
+
+            transcript_dir = (
+                home
+                / ".cursor"
+                / "projects"
+                / "Users-test-Documents-demo"
+                / "agent-transcripts"
+                / "chat-1"
+            )
+            transcript_dir.mkdir(parents=True)
+            transcript = transcript_dir / "chat-1.jsonl"
+            transcript.write_text(
+                '{"role": "user", "message": {"content": []}}\n',
+                encoding="utf-8",
+            )
+
+            with patch("cursor_chronicle.utils.Path.home", return_value=home):
+                base, files = _collect_cursor_files()
+
+            self.assertEqual(base, home)
+            self.assertIn(workspace_json, files)
+            self.assertIn(transcript, files)
+
 
 class TestCreateBackup(unittest.TestCase):
     """Test create_backup function."""

@@ -3,6 +3,7 @@ Shared utilities and constants for Cursor Chronicle.
 """
 
 import os
+import re
 import signal
 import urllib.parse
 import sys
@@ -63,6 +64,10 @@ def parse_workspace_storage_meta(workspace_data: Dict) -> Tuple[str, str]:
 # When set (non-empty after stripping), overrides OS-specific defaults below.
 CURSOR_USER_DIR_ENV = "CURSOR_CHRONICLE_CURSOR_USER_DIR"
 
+# Absolute path to newer Cursor project data (contains agent-transcripts, MCP data, etc.).
+# When set (non-empty after stripping), overrides ~/.cursor/projects.
+CURSOR_PROJECTS_DIR_ENV = "CURSOR_CHRONICLE_CURSOR_PROJECTS_DIR"
+
 
 def _cursor_user_dir() -> Path:
     """
@@ -86,6 +91,25 @@ def _cursor_user_dir() -> Path:
             return Path(appdata) / "Cursor" / "User"
         return home / "AppData" / "Roaming" / "Cursor" / "User"
     return home / ".config" / "Cursor" / "User"
+
+
+def get_cursor_projects_dir() -> Path:
+    """
+    Directory where newer Cursor versions store per-project agent transcripts.
+
+    Override with CURSOR_CHRONICLE_CURSOR_PROJECTS_DIR (tilde expands).
+    """
+    override = os.environ.get(CURSOR_PROJECTS_DIR_ENV)
+    if override is not None and override.strip():
+        return Path(override.strip()).expanduser()
+    return Path.home() / ".cursor" / "projects"
+
+
+def cursor_project_slug_for_path(path: str) -> str:
+    """Return Cursor's ~/.cursor/projects folder slug for an absolute path."""
+    if path.startswith("file://"):
+        path = urllib.parse.unquote(path[7:])
+    return re.sub(r"[^A-Za-z0-9]+", "-", path.strip("/")).strip("-")
 
 
 def get_cursor_paths() -> tuple:

@@ -177,6 +177,23 @@ class TestValidateBackup(unittest.TestCase):
             self.assertFalse(is_valid)
             self.assertIn("no database files", msg.lower())
 
+    def test_valid_backup_with_agent_transcript(self):
+        """New Cursor transcript-only backups are valid."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            archive_path = Path(tmpdir) / f"{BACKUP_PREFIX}test{BACKUP_SUFFIX}"
+
+            with tarfile.open(str(archive_path), "w:xz") as tar:
+                data = b'{"role": "user", "message": {"content": []}}\n'
+                info = tarfile.TarInfo(
+                    name=".cursor/projects/demo/agent-transcripts/chat/chat.jsonl"
+                )
+                info.size = len(data)
+                tar.addfile(info, io.BytesIO(data))
+
+            is_valid, msg, meta = _validate_backup(archive_path)
+            self.assertTrue(is_valid)
+            self.assertIn("valid", msg.lower())
+
 
 class TestRestoreBackup(unittest.TestCase):
     """Test restore_backup function."""

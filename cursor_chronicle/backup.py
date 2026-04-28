@@ -11,6 +11,7 @@ Backup format: .tar.xz
 import io
 import json
 import lzma
+import os
 import shutil
 import tarfile
 import tempfile
@@ -24,7 +25,7 @@ from .backup_formatters import (
     format_backup_summary,
     format_restore_summary,
 )
-from .utils import get_cursor_paths
+from .utils import CURSOR_PROJECTS_DIR_ENV, get_cursor_paths, get_cursor_projects_dir
 
 # Default backup directory
 DEFAULT_BACKUP_DIR = Path.home() / ".cursor-chronicle" / "backups"
@@ -68,17 +69,45 @@ def _collect_cursor_files() -> Tuple[Path, List[Path]]:
     # get_cursor_paths() returns ".../Cursor/User". We back up the entire Cursor
     # directory so restore can recover full IDE state, not only chat DB files.
     cursor_root = cursor_config_path.parent
-    if not cursor_root.exists():
+    roots = [cursor_root] if cursor_root.exists() else []
+
+    projects_root = get_cursor_projects_dir()
+    if projects_root.exists() and _should_collect_cursor_projects(
+        cursor_config_path,
+        projects_root,
+    ):
+        roots.append(projects_root)
+
+    if not roots:
         return cursor_root, []
 
+    if len(roots) == 1:
+        base_path = roots[0]
+    else:
+        base_path = Path(os.path.commonpath([str(root) for root in roots]))
+
     files_to_backup = []
-    for path in cursor_root.rglob("*"):
-        if not path.is_file() or path.is_symlink():
-            continue
-        files_to_backup.append(path)
+    for root in roots:
+        for path in root.rglob("*"):
+            if not path.is_file() or path.is_symlink():
+                continue
+            files_to_backup.append(path)
 
     files_to_backup.sort(key=lambda p: str(p))
-    return cursor_root, files_to_backup
+    return base_path, files_to_backup
+
+
+def _should_collect_cursor_projects(cursor_config_path: Path, projects_root: Path) -> bool:
+    """Include ~/.cursor/projects only when resolving real Cursor data."""
+    if os.environ.get(CURSOR_PROJECTS_DIR_ENV):
+        return True
+
+    cursor_home = projects_root.parent.parent
+    try:
+        cursor_config_path.relative_to(cursor_home)
+    except ValueError:
+        return False
+    return True
 
 
 def _build_backup_metadata(files: List[Path], base_path: Path) -> Dict:
@@ -321,8 +350,17 @@ def _validate_backup(backup_path: Path) -> Tuple[bool, str, Optional[Dict]]:
                     metadata = json.loads(meta_file.read().decode("utf-8"))
 
             has_db = any(m.endswith(".vscdb") for m in members)
-            if not has_db:
-                return False, "Backup contains no database files (.vscdb).", metadata
+            has_agent_transcripts = any(
+                "/agent-transcripts/" in m and m.endswith(".jsonl")
+                for m in members
+            )
+            if not has_db and not has_agent_transcripts:
+                return (
+                    False,
+                    "Backup contains no database files (.vscdb) "
+                    "or agent transcript files (.jsonl).",
+                    metadata,
+                )
             return True, "Backup is valid.", metadata
 
     except (tarfile.TarError, lzma.LZMAError) as e:

@@ -10,6 +10,7 @@ from typing import Dict, List
 from pathlib import Path
 from typing import Optional
 
+from .transcripts import get_transcript_messages, is_transcript_composer_id
 from .utils import get_cursor_paths
 
 # Module-level override for testing
@@ -18,6 +19,9 @@ _global_storage_override: Optional[Path] = None
 
 def get_dialog_messages(composer_id: str, db_path: Optional[Path] = None) -> List[Dict]:
     """Get all dialog messages by composer ID."""
+    if is_transcript_composer_id(composer_id):
+        return get_transcript_messages(composer_id)
+
     if db_path:
         global_storage_path = db_path
     elif _global_storage_override:
@@ -26,7 +30,7 @@ def get_dialog_messages(composer_id: str, db_path: Optional[Path] = None) -> Lis
         _, _, global_storage_path = get_cursor_paths()
 
     if not global_storage_path.exists():
-        raise FileNotFoundError(f"Global database not found: {global_storage_path}")
+        return []
 
     conn = sqlite3.connect(global_storage_path)
     cursor = conn.cursor()
