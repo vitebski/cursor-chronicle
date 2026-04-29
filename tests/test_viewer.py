@@ -388,6 +388,47 @@ class TestGetProjectsMultiRootMetadata(unittest.TestCase):
 class TestGetProjectsAgentTranscripts(unittest.TestCase):
     """Newer Cursor versions store agent dialogs under ~/.cursor/projects."""
 
+    def _write_workspace_state(
+        self,
+        workspace_dir: Path,
+        project_uri: str,
+        composers: list,
+    ) -> None:
+        workspace_dir.mkdir(parents=True)
+        (workspace_dir / "workspace.json").write_text(
+            json.dumps({"folder": project_uri}),
+            encoding="utf-8",
+        )
+        conn = sqlite3.connect(workspace_dir / "state.vscdb")
+        cursor = conn.cursor()
+        cursor.execute("CREATE TABLE ItemTable (key TEXT, value TEXT)")
+        cursor.execute(
+            "INSERT INTO ItemTable VALUES (?, ?)",
+            (
+                "composer.composerData",
+                json.dumps({"allComposers": composers}),
+            ),
+        )
+        conn.commit()
+        conn.close()
+
+    def _write_global_state(self, cursor_user: Path, composers: list) -> None:
+        global_storage = cursor_user / "globalStorage"
+        global_storage.mkdir(parents=True)
+        conn = sqlite3.connect(global_storage / "state.vscdb")
+        cursor = conn.cursor()
+        cursor.execute("CREATE TABLE ItemTable (key TEXT, value TEXT)")
+        cursor.execute("CREATE TABLE cursorDiskKV (key TEXT, value TEXT)")
+        cursor.execute(
+            "INSERT INTO ItemTable VALUES (?, ?)",
+            (
+                "composer.composerHeaders",
+                json.dumps({"allComposers": composers}),
+            ),
+        )
+        conn.commit()
+        conn.close()
+
     def test_get_projects_reads_agent_transcripts_without_state_db(self):
         with tempfile.TemporaryDirectory() as tmp:
             home = Path(tmp)
@@ -464,6 +505,96 @@ class TestGetProjectsAgentTranscripts(unittest.TestCase):
             self.assertEqual([m["type"] for m in messages], [1, 2])
             self.assertEqual(messages[0]["text"], "How do I back up dialogs?")
             self.assertEqual(messages[1]["text"], "Use cursor-chronicle --backup.")
+
+    def test_get_projects_reads_global_agent_headers(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            project_path = home / "Documents" / "restored-app"
+            project_path.mkdir(parents=True)
+            project_uri = project_path.resolve().as_uri()
+
+            cursor_user = home / "Library" / "Application Support" / "Cursor" / "User"
+            workspace_id = "workspace-1"
+            self._write_workspace_state(
+                cursor_user / "workspaceStorage" / workspace_id,
+                project_uri,
+                [],
+            )
+            self._write_global_state(
+                cursor_user,
+                [
+                    {
+                        "type": "head",
+                        "composerId": "agent-1",
+                        "name": "Restored agent chat",
+                        "lastUpdatedAt": 1704153600000,
+                        "createdAt": 1704067200000,
+                        "workspaceIdentifier": {
+                            "id": workspace_id,
+                            "uri": {
+                                "fsPath": str(project_path.resolve()),
+                                "external": project_uri,
+                                "path": str(project_path.resolve()),
+                                "scheme": "file",
+                            },
+                        },
+                    }
+                ],
+            )
+
+            with patch("cursor_chronicle.utils.Path.home", return_value=home):
+                with patch("cursor_chronicle.utils.sys.platform", "darwin"):
+                    viewer = cursor_chronicle.CursorChatViewer()
+                    projects = viewer.get_projects()
+
+            self.assertEqual(len(projects), 1)
+            self.assertEqual(projects[0]["project_name"], "restored-app")
+            self.assertEqual(projects[0]["folder_path"], str(project_path.resolve()))
+            self.assertEqual([c["composerId"] for c in projects[0]["composers"]], ["agent-1"])
+
+    def test_get_projects_merges_duplicate_empty_workspaces(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            project_path = home / "Documents" / "dupe-app"
+            project_path.mkdir(parents=True)
+            project_uri = project_path.resolve().as_uri()
+
+            cursor_user = home / "Library" / "Application Support" / "Cursor" / "User"
+            self._write_workspace_state(
+                cursor_user / "workspaceStorage" / "old-empty",
+                project_uri,
+                [],
+            )
+            self._write_workspace_state(
+                cursor_user / "workspaceStorage" / "new-empty",
+                project_uri,
+                [],
+            )
+            self._write_global_state(
+                cursor_user,
+                [
+                    {
+                        "type": "head",
+                        "composerId": "agent-2",
+                        "name": "Single merged chat",
+                        "lastUpdatedAt": 1704153600000,
+                        "createdAt": 1704067200000,
+                        "workspaceIdentifier": {
+                            "id": "new-empty",
+                            "uri": {"fsPath": str(project_path.resolve())},
+                        },
+                    }
+                ],
+            )
+
+            with patch("cursor_chronicle.utils.Path.home", return_value=home):
+                with patch("cursor_chronicle.utils.sys.platform", "darwin"):
+                    viewer = cursor_chronicle.CursorChatViewer()
+                    projects = viewer.get_projects()
+
+            self.assertEqual(len(projects), 1)
+            self.assertEqual(projects[0]["folder_path"], str(project_path.resolve()))
+            self.assertEqual(len(projects[0]["composers"]), 1)
 
 
 class TestListProjects(unittest.TestCase):

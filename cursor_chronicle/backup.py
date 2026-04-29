@@ -13,6 +13,7 @@ import json
 import lzma
 import os
 import shutil
+import sqlite3
 import stat as stat_module
 import sys
 import tarfile
@@ -32,6 +33,7 @@ from .utils import (
     CURSOR_USER_DIR_ENV,
     get_cursor_paths,
     get_cursor_projects_dir,
+    parse_workspace_storage_meta,
 )
 
 # Default backup directory
@@ -40,6 +42,8 @@ DEFAULT_BACKUP_DIR = Path.home() / ".cursor-chronicle" / "backups"
 # Backup filename pattern
 BACKUP_PREFIX = "cursor_backup_"
 BACKUP_SUFFIX = ".tar.xz"
+BACKUP_TYPE_MANUAL = "manual"
+BACKUP_TYPE_PRE_RESTORE = "pre_restore"
 
 # Metadata filename inside the archive
 BACKUP_META_FILE = "backup_meta.json"
@@ -59,6 +63,7 @@ FileSnapshot = Tuple[Path, str, int, float]
 __all__ = [
     "create_backup",
     "list_backups",
+    "latest_restorable_backup",
     "restore_backup",
     "get_backup_dir",
     "format_backup_summary",
@@ -214,6 +219,7 @@ def _snapshot_backup_files(files: List[Path], base_path: Path) -> List[FileSnaps
 def _build_backup_metadata_from_snapshots(
     snapshots: List[FileSnapshot],
     base_path: Path,
+    backup_type: str = BACKUP_TYPE_MANUAL,
 ) -> Dict:
     """Build metadata dict for already-snapshotted files."""
     file_entries = []
@@ -229,6 +235,7 @@ def _build_backup_metadata_from_snapshots(
 
     return {
         "created_at": datetime.now().isoformat(),
+        "backup_type": backup_type,
         "cursor_base_path": str(base_path),
         "total_files": len(snapshots),
         "total_size_bytes": total_size,
@@ -256,6 +263,7 @@ def _cleanup_partial_backups(backup_dir: Path) -> None:
 def create_backup(
     backup_dir: Optional[Path] = None,
     progress_callback: Optional[Callable[[Dict], None]] = None,
+    backup_type: str = BACKUP_TYPE_MANUAL,
 ) -> Dict:
     """Create a compressed backup of all Cursor files."""
     if backup_dir is None:
@@ -279,7 +287,11 @@ def create_backup(
     if tmp_backup_path.exists():
         tmp_backup_path.unlink()
 
-    metadata = _build_backup_metadata_from_snapshots(snapshots, base_path)
+    metadata = _build_backup_metadata_from_snapshots(
+        snapshots,
+        base_path,
+        backup_type=backup_type,
+    )
     total_size = metadata["total_size_bytes"]
     total_files = len(snapshots)
 
@@ -395,13 +407,28 @@ def list_backups(backup_dir: Optional[Path] = None) -> List[Dict]:
         meta_data = _read_backup_metadata(entry)
         if meta_data:
             backup_info["metadata"] = meta_data
+            backup_info["backup_type"] = meta_data.get("backup_type", BACKUP_TYPE_MANUAL)
+            backup_info["is_pre_restore"] = (
+                backup_info["backup_type"] == BACKUP_TYPE_PRE_RESTORE
+            )
             if not backup_info["created_at"] and "created_at" in meta_data:
                 backup_info["created_at"] = meta_data["created_at"]
+        else:
+            backup_info["backup_type"] = BACKUP_TYPE_MANUAL
+            backup_info["is_pre_restore"] = False
 
         backups.append(backup_info)
 
     backups.sort(key=lambda x: x.get("created_at") or "", reverse=True)
     return backups
+
+
+def latest_restorable_backup(backups: List[Dict]) -> Optional[Dict]:
+    """Return the newest normal backup, skipping safety backups created by restore."""
+    for backup in backups:
+        if not backup.get("is_pre_restore"):
+            return backup
+    return None
 
 
 def _read_backup_metadata(backup_path: Path) -> Optional[Dict]:
@@ -477,6 +504,215 @@ def _validate_backup(backup_path: Path) -> Tuple[bool, str, Optional[Dict]]:
         return False, f"Cannot read backup file: {e}", None
 
 
+def _is_safe_tar_member(member_name: str) -> bool:
+    member_path = Path(member_name)
+    if member_path.is_absolute():
+        return False
+    return ".." not in member_path.parts
+
+
+def _join_archive_suffix(base_path: Path, suffix: str) -> Path:
+    return base_path.joinpath(*Path(suffix).parts)
+
+
+def _resolve_restore_destination(
+    member_name: str,
+    target_base: Path,
+    cursor_user_dir: Path,
+    projects_dir: Path,
+) -> Path:
+    """Map archive paths from any supported backup layout to current Cursor paths."""
+    normalized = member_name.replace("\\", "/")
+
+    project_marker = ".cursor/projects/"
+    if project_marker in normalized:
+        suffix = normalized.split(project_marker, 1)[1]
+        return _join_archive_suffix(projects_dir, suffix)
+
+    user_markers = (
+        "Library/Application Support/Cursor/User/",
+        "AppData/Roaming/Cursor/User/",
+        ".config/Cursor/User/",
+    )
+    for marker in user_markers:
+        if marker in normalized:
+            suffix = normalized.split(marker, 1)[1]
+            return _join_archive_suffix(cursor_user_dir, suffix)
+
+    if normalized.startswith("User/"):
+        return _join_archive_suffix(cursor_user_dir, normalized[len("User/"):])
+
+    if normalized.startswith(("globalStorage/", "workspaceStorage/")):
+        return _join_archive_suffix(cursor_user_dir, normalized)
+
+    return target_base / Path(member_name)
+
+
+def _workspace_ids_by_folder(workspace_storage_path: Path) -> Dict[str, str]:
+    """Return target-machine workspace ids keyed by folder path."""
+    workspace_ids: Dict[str, Tuple[str, float]] = {}
+    if not workspace_storage_path.exists():
+        return {}
+
+    try:
+        workspace_dirs = list(workspace_storage_path.iterdir())
+    except OSError:
+        return {}
+
+    for workspace_dir in workspace_dirs:
+        workspace_json = workspace_dir / "workspace.json"
+        if not workspace_json.is_file():
+            continue
+        try:
+            workspace_data = json.loads(workspace_json.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+
+        _, folder_path = parse_workspace_storage_meta(workspace_data)
+        if not folder_path:
+            continue
+
+        try:
+            modified = max(
+                workspace_json.stat().st_mtime,
+                (workspace_dir / "state.vscdb").stat().st_mtime,
+            )
+        except OSError:
+            modified = 0
+
+        existing = workspace_ids.get(folder_path)
+        if not existing or modified >= existing[1]:
+            workspace_ids[folder_path] = (workspace_dir.name, modified)
+
+    return {
+        folder_path: workspace_id
+        for folder_path, (workspace_id, _) in workspace_ids.items()
+    }
+
+
+def _path_from_cursor_uri(uri) -> str:
+    if isinstance(uri, dict):
+        folder_path = uri.get("fsPath") or uri.get("path")
+        if isinstance(folder_path, str) and folder_path:
+            return folder_path
+        external = uri.get("external")
+        if isinstance(external, str) and external:
+            return parse_workspace_storage_meta({"folder": external})[1]
+    if isinstance(uri, str) and uri:
+        return parse_workspace_storage_meta({"folder": uri})[1]
+    return ""
+
+
+def _rebind_workspace_identifier(workspace_identifier, workspace_ids: Dict[str, str]) -> bool:
+    if not isinstance(workspace_identifier, dict):
+        return False
+
+    folder_path = _path_from_cursor_uri(workspace_identifier.get("uri"))
+    target_workspace_id = workspace_ids.get(folder_path)
+    if not target_workspace_id or workspace_identifier.get("id") == target_workspace_id:
+        return False
+
+    workspace_identifier["id"] = target_workspace_id
+    return True
+
+
+def _rebind_agent_history_workspace_ids(
+    global_storage_path: Path,
+    workspace_ids: Dict[str, str],
+) -> None:
+    """Point restored agent history at the target machine's workspace ids."""
+    if not workspace_ids or not global_storage_path.exists():
+        return
+
+    try:
+        conn = sqlite3.connect(global_storage_path)
+        cursor = conn.cursor()
+    except sqlite3.Error:
+        return
+
+    try:
+        _rebind_composer_headers(cursor, workspace_ids)
+        _rebind_agent_projects(cursor, workspace_ids, "glass.localAgentProjects.v1")
+        _rebind_agent_projects(cursor, workspace_ids, "glass.cloudAgentProjects.v1")
+        conn.commit()
+    except sqlite3.Error:
+        conn.rollback()
+    finally:
+        conn.close()
+
+
+def _rebind_composer_headers(cursor, workspace_ids: Dict[str, str]) -> None:
+    cursor.execute(
+        "SELECT value FROM ItemTable WHERE key = 'composer.composerHeaders'"
+    )
+    result = cursor.fetchone()
+    if not result:
+        return
+    try:
+        data = json.loads(result[0])
+    except json.JSONDecodeError:
+        return
+
+    changed = False
+    for composer in data.get("allComposers", []):
+        if isinstance(composer, dict):
+            changed = (
+                _rebind_workspace_identifier(
+                    composer.get("workspaceIdentifier"),
+                    workspace_ids,
+                )
+                or changed
+            )
+
+    if changed:
+        cursor.execute(
+            "UPDATE ItemTable SET value = ? WHERE key = 'composer.composerHeaders'",
+            (json.dumps(data, separators=(",", ":")),),
+        )
+
+
+def _rebind_agent_projects(cursor, workspace_ids: Dict[str, str], key: str) -> None:
+    cursor.execute("SELECT value FROM ItemTable WHERE key = ?", (key,))
+    result = cursor.fetchone()
+    if not result:
+        return
+    try:
+        projects = json.loads(result[0])
+    except json.JSONDecodeError:
+        return
+    if not isinstance(projects, list):
+        return
+
+    changed = False
+    for project in projects:
+        if isinstance(project, dict):
+            changed = (
+                _rebind_workspace_identifier(project.get("workspace"), workspace_ids)
+                or changed
+            )
+
+    if changed:
+        cursor.execute(
+            "UPDATE ItemTable SET value = ? WHERE key = ?",
+            (json.dumps(projects, separators=(",", ":")), key),
+        )
+
+
+def _cleanup_stale_sqlite_sidecars(destinations: List[Path]) -> None:
+    """Remove existing WAL/SHM sidecars when the backup does not restore them."""
+    destination_set = {destination.resolve() for destination in destinations}
+    for destination in destinations:
+        if destination.name.endswith(".vscdb"):
+            for suffix in SQLITE_SIDECAR_SUFFIXES:
+                sidecar = destination.with_name(f"{destination.name}{suffix}")
+                if sidecar.resolve() in destination_set:
+                    continue
+                try:
+                    sidecar.unlink()
+                except OSError:
+                    continue
+
+
 def restore_backup(
     backup_path: Path,
     create_pre_restore_backup: bool = True,
@@ -496,10 +732,39 @@ def restore_backup(
 
     cursor_config_path = get_cursor_paths()[0]
     target_base = Path(metadata["cursor_base_path"]) if metadata and "cursor_base_path" in metadata else cursor_config_path
+    projects_dir = get_cursor_projects_dir()
+    current_workspace_ids = _workspace_ids_by_folder(
+        cursor_config_path / "workspaceStorage"
+    )
+
+    try:
+        with tarfile.open(str(backup_path), "r:xz") as tar:
+            members = [
+                m for m in tar.getmembers()
+                if m.name != BACKUP_META_FILE and _is_safe_tar_member(m.name)
+            ]
+    except (tarfile.TarError, lzma.LZMAError, OSError) as e:
+        result["errors"].append(f"Error reading backup members: {e}")
+        return result
+
+    destinations = [
+        _resolve_restore_destination(
+            member.name,
+            target_base,
+            cursor_config_path,
+            projects_dir,
+        )
+        for member in members
+        if member.isfile()
+    ]
+    _cleanup_stale_sqlite_sidecars(destinations)
 
     if create_pre_restore_backup:
         try:
-            pre_backup = create_backup(backup_dir=backup_dir)
+            pre_backup = create_backup(
+                backup_dir=backup_dir,
+                backup_type=BACKUP_TYPE_PRE_RESTORE,
+            )
             if pre_backup.get("backup_path"):
                 result["pre_restore_backup"] = pre_backup["backup_path"]
         except Exception as e:
@@ -508,21 +773,25 @@ def restore_backup(
     with tempfile.TemporaryDirectory() as tmpdir:
         try:
             with tarfile.open(str(backup_path), "r:xz") as tar:
-                members = [
-                    m for m in tar.getmembers()
-                    if m.name != BACKUP_META_FILE and not m.name.startswith("..")
-                ]
                 total = len(members)
-                tar.extractall(path=tmpdir, members=members)
 
                 for idx, member in enumerate(members, 1):
-                    if member.isdir():
+                    if not member.isfile():
                         continue
-                    src = Path(tmpdir) / member.name
-                    dst = target_base / member.name
+                    src_file = tar.extractfile(member)
+                    if not src_file:
+                        continue
+                    dst = _resolve_restore_destination(
+                        member.name,
+                        target_base,
+                        cursor_config_path,
+                        projects_dir,
+                    )
                     try:
                         dst.parent.mkdir(parents=True, exist_ok=True)
-                        shutil.copy2(str(src), str(dst))
+                        with dst.open("wb") as output_file:
+                            shutil.copyfileobj(src_file, output_file)
+                        os.utime(dst, (member.mtime, member.mtime))
                         result["restored_files"] += 1
                     except OSError as e:
                         result["errors"].append(f"Failed to restore {member.name}: {e}")
@@ -537,6 +806,11 @@ def restore_backup(
         except (tarfile.TarError, lzma.LZMAError, OSError) as e:
             result["errors"].append(f"Error during extraction: {e}")
             return result
+
+    _rebind_agent_history_workspace_ids(
+        cursor_config_path / "globalStorage" / "state.vscdb",
+        current_workspace_ids,
+    )
 
     result["success"] = result["restored_files"] > 0 and not result["errors"]
     return result

@@ -322,8 +322,12 @@ cursor-chronicle --restore latest --no-pre-backup
 ### How It Works
 
 1. **Backup** scans the Cursor user data directory for chat databases, SQLite sidecars, workspace metadata, and agent transcript JSONL files, then stores them in `~/.cursor-chronicle/backups/` by default.
-2. **Restore** extracts the archive back to the original location. By default, a safety backup is created before restoring, so you can roll back if needed.
+2. **Restore** maps Cursor storage files from the archive to the current machine's Cursor data directories. By default, a safety backup is created before restoring, so you can roll back if needed.
 3. Each archive includes a `backup_meta.json` with file inventory, sizes, and timestamps.
+
+### Cross-Machine Restore Limitation
+
+Backups can be restored on another machine, but Cursor workspace identity is based on absolute project paths. If a project was opened at `/Users/alice/Documents/app` on the source Mac and lives at `/Users/bob/Documents/app` on the target Mac, restored chats may appear under the old path or may not attach cleanly to the target project until the project path matches or the metadata is remapped.
 
 ### Backup Output
 

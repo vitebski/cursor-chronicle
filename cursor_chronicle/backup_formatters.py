@@ -62,6 +62,8 @@ def format_backup_list(backups: List[Dict]) -> str:
 
     for idx, backup in enumerate(backups, 1):
         lines.append(f"  {idx}. {backup['filename']}")
+        if backup.get("is_pre_restore"):
+            lines.append("     🛟 Type: pre-restore safety backup")
         lines.append(f"     📦 Size: {_format_size(backup['size'])}")
 
         if backup.get("created_at"):

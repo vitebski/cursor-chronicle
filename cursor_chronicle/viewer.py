@@ -3,6 +3,7 @@ Core CursorChatViewer class - project and dialog data access.
 """
 
 import json
+import os
 import sqlite3
 from datetime import datetime
 from pathlib import Path
@@ -20,7 +21,13 @@ from .transcripts import (
     load_project_path_map,
     parse_transcript_summary,
 )
-from .utils import TOOL_TYPES, get_cursor_paths, get_cursor_projects_dir, parse_workspace_storage_meta
+from .utils import (
+    TOOL_TYPES,
+    format_workspace_project_display_name,
+    get_cursor_paths,
+    get_cursor_projects_dir,
+    parse_workspace_storage_meta,
+)
 
 
 class CursorChatViewer:
@@ -67,11 +74,15 @@ class CursorChatViewer:
 
     def get_projects(self) -> List[Dict]:
         """Get list of all projects with their metadata."""
-        projects = self._get_workspace_storage_projects()
+        projects = self._dedupe_projects(self._get_workspace_storage_projects())
+
+        if self._should_include_global_composer_headers():
+            self._merge_global_composer_header_projects(projects)
 
         if self._should_include_agent_transcripts():
             self._merge_agent_transcript_projects(projects)
 
+        projects = self._dedupe_projects(projects)
         projects.sort(
             key=lambda x: (
                 x["latest_dialog"].get("lastUpdatedAt", 0) if x["latest_dialog"] else 0
@@ -136,9 +147,108 @@ class CursorChatViewer:
 
         return projects
 
+    def _merge_global_composer_header_projects(self, projects: List[Dict]) -> None:
+        """Merge Cursor's current global agent history index into projects."""
+        composer_headers = self._load_global_composer_headers()
+        if not composer_headers:
+            return
+
+        projects_by_key = {
+            self._project_merge_key(project): project
+            for project in projects
+        }
+        grouped_projects: Dict[str, Dict] = {}
+
+        for composer in composer_headers:
+            if composer.get("isDraft"):
+                continue
+            folder_path = self._folder_path_from_global_header(composer)
+            if not folder_path:
+                continue
+
+            key = folder_path
+            project = grouped_projects.get(key)
+            if not project:
+                project_name = format_workspace_project_display_name(
+                    os.path.basename(folder_path)
+                )
+                workspace_id = (
+                    composer.get("workspaceIdentifier", {}).get("id")
+                    if isinstance(composer.get("workspaceIdentifier"), dict)
+                    else None
+                )
+                project = {
+                    "workspace_id": f"global-headers:{workspace_id or key}",
+                    "project_name": project_name,
+                    "folder_path": folder_path,
+                    "composers": [],
+                    "latest_dialog": None,
+                    "state_db_path": None,
+                }
+                grouped_projects[key] = project
+
+            project["composers"].append(composer)
+
+        for project in grouped_projects.values():
+            project["latest_dialog"] = self._latest_dialog(project["composers"])
+            self._merge_project(projects_by_key, projects, project)
+
+    def _load_global_composer_headers(self) -> List[Dict]:
+        if not self.global_storage_path.exists():
+            return []
+
+        try:
+            conn = sqlite3.connect(self.global_storage_path)
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT value FROM ItemTable WHERE key = 'composer.composerHeaders'"
+            )
+            result = cursor.fetchone()
+            conn.close()
+        except sqlite3.Error:
+            return []
+
+        if not result:
+            return []
+
+        try:
+            composer_data = json.loads(result[0])
+        except json.JSONDecodeError:
+            return []
+        composers = composer_data.get("allComposers", [])
+        return composers if isinstance(composers, list) else []
+
+    @staticmethod
+    def _folder_path_from_global_header(composer: Dict) -> str:
+        workspace_identifier = composer.get("workspaceIdentifier")
+        if not isinstance(workspace_identifier, dict):
+            return ""
+
+        uri = workspace_identifier.get("uri")
+        if isinstance(uri, dict):
+            folder_path = uri.get("fsPath") or uri.get("path")
+            if isinstance(folder_path, str) and folder_path:
+                return folder_path
+            external = uri.get("external")
+            if isinstance(external, str) and external:
+                return parse_workspace_storage_meta({"folder": external})[1]
+
+        if isinstance(uri, str) and uri:
+            return parse_workspace_storage_meta({"folder": uri})[1]
+
+        return ""
+
     def _should_include_agent_transcripts(self) -> bool:
         """Avoid mixing real ~/.cursor/projects into tests with overridden paths."""
         return self.workspace_storage_path == get_cursor_paths()[1]
+
+    def _should_include_global_composer_headers(self) -> bool:
+        """Avoid mixing real global storage into tests with overridden paths."""
+        paths = get_cursor_paths()
+        return (
+            self.workspace_storage_path == paths[1]
+            and self.global_storage_path == paths[2]
+        )
 
     def _merge_agent_transcript_projects(self, projects: List[Dict]) -> None:
         """Append or merge newer ~/.cursor/projects transcript-backed dialogs."""
@@ -163,6 +273,8 @@ class CursorChatViewer:
             )
             composer = parse_transcript_summary(transcript_path)
             key = folder_path or project_name
+            if self._has_indexed_composer(projects_by_key.get(key), transcript_path.stem):
+                continue
 
             if key not in projects_by_key:
                 projects_by_key[key] = {
@@ -176,8 +288,60 @@ class CursorChatViewer:
                 projects.append(projects_by_key[key])
 
             project = projects_by_key[key]
-            project["composers"].append(composer)
+            self._append_unique_composer(project["composers"], composer)
             project["latest_dialog"] = self._latest_dialog(project["composers"])
+
+    def _dedupe_projects(self, projects: List[Dict]) -> List[Dict]:
+        deduped: List[Dict] = []
+        projects_by_key: Dict[str, Dict] = {}
+        for project in projects:
+            self._merge_project(projects_by_key, deduped, project)
+        return deduped
+
+    def _merge_project(
+        self,
+        projects_by_key: Dict[str, Dict],
+        projects: List[Dict],
+        incoming: Dict,
+    ) -> Dict:
+        key = self._project_merge_key(incoming)
+        existing = projects_by_key.get(key)
+        if not existing:
+            incoming["composers"] = self._unique_composers(incoming.get("composers", []))
+            incoming["latest_dialog"] = self._latest_dialog(incoming["composers"])
+            projects_by_key[key] = incoming
+            projects.append(incoming)
+            return incoming
+
+        for composer in incoming.get("composers", []):
+            self._append_unique_composer(existing["composers"], composer)
+        existing["latest_dialog"] = self._latest_dialog(existing["composers"])
+        if not existing.get("state_db_path") and incoming.get("state_db_path"):
+            existing["state_db_path"] = incoming["state_db_path"]
+        return existing
+
+    @staticmethod
+    def _unique_composers(composers: List[Dict]) -> List[Dict]:
+        unique: List[Dict] = []
+        for composer in composers:
+            CursorChatViewer._append_unique_composer(unique, composer)
+        return unique
+
+    @staticmethod
+    def _append_unique_composer(composers: List[Dict], composer: Dict) -> None:
+        composer_id = composer.get("composerId")
+        if composer_id and any(c.get("composerId") == composer_id for c in composers):
+            return
+        composers.append(composer)
+
+    @staticmethod
+    def _has_indexed_composer(project: Optional[Dict], composer_id: str) -> bool:
+        if not project:
+            return False
+        return any(
+            composer.get("composerId") == composer_id
+            for composer in project.get("composers", [])
+        )
 
     @staticmethod
     def _project_merge_key(project: Dict) -> str:

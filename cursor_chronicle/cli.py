@@ -13,6 +13,7 @@ from .backup import (
     format_backup_list,
     format_backup_summary,
     format_restore_summary,
+    latest_restorable_backup,
     list_backups,
     restore_backup,
 )
@@ -260,11 +261,12 @@ def _run_restore(args):
 
     if backup_identifier.lower() == "latest":
         backups = list_backups(backup_dir=backup_dir)
-        if not backups:
-            print("❌ No backups found. Create one first with: cursor-chronicle --backup")
+        backup = latest_restorable_backup(backups)
+        if not backup:
+            print("❌ No restorable backups found. Create one first with: cursor-chronicle --backup")
             return
-        backup_path = Path(backups[0]["path"])
-        print(f"Using latest backup: {backups[0]['filename']}")
+        backup_path = Path(backup["path"])
+        print(f"Using latest backup: {backup['filename']}")
     else:
         backup_path = Path(backup_identifier)
         if not backup_path.exists():
